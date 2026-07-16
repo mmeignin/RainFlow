@@ -1,0 +1,44 @@
+# Flow Matching baseline
+
+# ── data ──────────────────────────────────────────────────────────────────────
+data_csv: ./splits/train_split.csv
+val_csv:  ./splits/val_split.csv
+norm_csv: ./normalisation_data/normalisation.csv
+# TODO(MRMS port): SEVIRI channel set; replace with the MRMS equivalent.
+channels: WV_062,WV_073,IR_087,IR_097,IR_108,IR_120,IR_134
+
+# ── transforms ────────────────────────────────────────────────────────────────
+random_flip: true
+flip_prob: 0.5
+x_transform:
+  type: Log1pZScore
+cond_transform:
+  type: Normalize
+  sigma_factor: 1
+
+# ── model ─────────────────────────────────────────────────────────────────────
+num_channel: 64             # must be divisible by 32 (GroupNorm num_groups)
+image_size: 256             
+channel_mult: [1, 1, 2, 3, 4]    
+attention_resolutions: "16"       
+# ── optimisation ──────────────────────────────────────────────────────────────
+total_steps: 400000
+batch_size: 16
+num_workers: 2
+lr: 2.0e-4
+grad_clip: 1.0
+warmup_steps: 5000
+scheduler: linear_warmup     # cosine_warmup | linear_warmup | constant
+ema_decay: 0.9999
+cfg_drop: 0.1
+seed: 1242857
+
+# ── evaluation / checkpointing ────────────────────────────────────────────────
+eval_every: 5000
+save_every: 20000
+log_every: 100
+
+# ── output ────────────────────────────────────────────────────────────────────
+output_dir: ./results/
+exp_name: FM_baseline
+debug: false

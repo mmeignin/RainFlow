@@ -1,0 +1,9 @@
+tests/
+*.pt
+*.npy
+*.pyc
+*.err
+*.out
+*.sh
+splits/*.csv
+!splits/*.placeholder.csv

@@ -1,0 +1,31 @@
+# Flow Matching inference.
+
+# ── checkpoint ────────────────────────────────────────────────────────────────
+exp_dir: ./results/FM_baseline
+ckpt_name: best
+use_ema: true
+
+# ── data ──────────────────────────────────────────────────────────────────────
+data_csv: ./splits/test_split.csv
+start_idx: 0
+end_idx: 16                # -1 = to the end
+
+# ── solver ────────────────────────────────────────────────────────────────────
+solver: dopri5                 # "euler" or "dopri5"
+n_steps: 50                   # euler only
+rtol: 1.0e-3                  # dopri5 only
+atol: 1.0e-3                  # dopri5 only
+
+# ── classifier-free guidance / ensembling ─────────────────────────────────────
+guidance_scale: 1.0          # >1 requires a checkpoint trained with cfg_drop > 0
+n_runs: 50                   # independent samples per input, for an ensemble
+
+# ── output ────────────────────────────────────────────────────────────────────
+save_npy: false
+save_png: true
+
+# ── misc ──────────────────────────────────────────────────────────────────────
+batch_size: 16
+num_workers: 2
+seed: 1242857
+debug: false
