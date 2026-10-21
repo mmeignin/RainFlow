@@ -7,7 +7,6 @@ import numpy as np
 import torch as th
 import torch.nn as nn
 import torch.nn.functional as F
-import torch
 
 from .fp16_util import convert_module_to_f16, convert_module_to_f32
 from .nn import (
@@ -387,7 +386,10 @@ class UNetModel(nn.Module):
         per attention head.
     :param num_heads_upsample: works with num_heads to set a different number of heads for
         upsampling. Deprecated.
-    :param use_scale_shift_norm: use a FiLM-like conditioning mechanism.
+    :param use_scale_shift_norm: condition each ResBlock on the time embedding with
+        adaLN/FiLM (`norm(h) * (1 + scale) + shift`) instead of an additive bias
+        (`h + emb`). Changes the width of every ResBlock's `emb_layers`, so checkpoints
+        are not interchangeable across it.
     :param resblock_updown: use residual blocks for up/downsampling.
     :param use_new_attention_order: use a different attention pattern for potentially increased
         efficiency.
@@ -598,20 +600,19 @@ class UNetModel(nn.Module):
             onto `x` along the channel dimension (or None for no conditioning).
         :return: an [N x C x ...] Tensor of outputs.
 
-        Conditioning design: `cond` (IR channels) is combined with `x` (rain
-        rate) by channel-concatenation rather than FiLM/cross-attention. This
-        is a deliberate choice: `cond` is pixel-aligned with `x` (same
-        resolution/grid), which is the standard conditioning approach for
-        spatially-aligned image-to-image tasks (as in SR3/Palette-style
-        diffusion models) — FiLM/cross-attention are better suited to
-        cross-modal or cross-resolution conditioning, which isn't the case
-        here. Note: at inference, the CFG unconditional token `null_cond` is
-        broadcast into this same concat slot in place of `cond` to obtain the
-        unconditional model output.
+        Two independent conditioning paths:
+
+        *Spatial* — `cond` (IR) is concatenated to `x` (rain rate) rather than injected via
+        FiLM/cross-attention, since it is pixel-aligned with `x`; this is standard for
+        image-to-image diffusion (SR3/Palette). At inference CFG broadcasts `null_cond`
+        into the same concat slot to get the unconditional output.
+
+        *Time* — `t` goes through the sinusoidal embedding and `time_embed` MLP into every
+        ResBlock, entering as adaLN or additive bias per `use_scale_shift_norm`.
         """
         timesteps = t
         if cond is not None:
-                x = torch.cat([x, cond], dim=1)
+            x = th.cat([x, cond], dim=1)
 
         while timesteps.dim() > 1:
             timesteps = timesteps[:, 0]
@@ -902,7 +903,7 @@ class UNetModelWrapper(UNetModel):
             image_size=image_size,
             in_channels=dim[0],
             model_channels=num_channels,
-            out_channels=out_channels, #(dim[0] if not learn_sigma else dim[0] * 2),
+            out_channels=out_channels,
             num_res_blocks=num_res_blocks,
             attention_resolutions=tuple(attention_ds),
             dropout=dropout,

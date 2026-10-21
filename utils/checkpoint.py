@@ -45,7 +45,7 @@ def read_best_val(path, device):
 
 def save_best(ckptdir, val_loss, best_val, **kwargs):
     """Write best.pt when `val_loss` improves. Returns the (possibly updated) best."""
-    if val_loss >= best_val:
+    if not (val_loss < best_val):        # False for NaN — the point of the inversion
         return best_val
     save_checkpoint(os.path.join(ckptdir, "best.pt"), best_val=val_loss, **kwargs)
     return val_loss

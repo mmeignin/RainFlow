@@ -88,10 +88,6 @@ class CenterCrop(SharedTransform):
 
 class Normalize(ValueTransform):
     """Per-channel z-score.
-
-    forward: (t - mean) / (sigma_factor * std)
-    inverse: t * sigma_factor * std + mean
-
     `mean`/`std` are 1-D, length C, matching the stream's channel count.
     """
 
@@ -114,10 +110,6 @@ class Normalize(ValueTransform):
 
 class MinMax(ValueTransform):
     """Per-channel min-max into [-1, 1].
-
-    forward: 2 * (t - vmin) / (vmax - vmin) - 1
-    inverse: (t + 1) / 2 * (vmax - vmin) + vmin
-
     `vmin`/`vmax` are 1-D, length C, matching the stream's channel count.
     """
 
@@ -139,9 +131,6 @@ class MinMax(ValueTransform):
 
 class Log1pZScore(ValueTransform):
     """Maps rain [0, inf) to roughly N(0, 1). `mean`/`std` are scalars over log1p pixels.
-
-    forward: (log1p(t) - mean) / std
-    inverse: expm1(t * std + mean), clamped at 0
     """
 
     def __init__(self, mean: float, std: float):
@@ -154,3 +143,13 @@ class Log1pZScore(ValueTransform):
 
     def inverse(self, t):
         return torch.expm1(t * self.std + self.mean).clamp_min(0)
+
+
+class Log1p(ValueTransform):
+    """
+    """
+    def forward(self, t):
+        return torch.log1p(t.clamp_min(0))
+
+    def inverse(self, t):
+        return torch.expm1(t).clamp_min(0)

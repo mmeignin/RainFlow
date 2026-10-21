@@ -1,16 +1,22 @@
 """
 ODE samplers for the learned velocity field.
-Training previews call `euler_sample` with the defaults (`null_cond=None`,
-`guidance_scale=1.0`), i.e. unguided. Inference may guide.
 """
 
 import torch
 
 
+def _calls_per_eval(null_cond, guidance_scale) -> int:
+    """Model calls made by one cfg_forward: 2 when guiding (cond + null), else 1.
+
+    Used to report NFE in model calls.
+    """
+    return 2 if (guidance_scale != 1.0 and null_cond is not None) else 1
+
+
 def cfg_forward(model, t, x, cond, null_cond=None, guidance_scale=1.0):
     """Velocity at (t, x, cond), with optional classifier-free guidance."""
     t = t.expand(x.shape[0]) if t.dim() == 0 else t
-    if guidance_scale == 1.0 or null_cond is None:
+    if _calls_per_eval(null_cond, guidance_scale) == 1:
         return model(t, x, cond)
     null = null_cond.expand(x.shape[0], -1, x.shape[2], x.shape[3])
     v_cond = model(t, x, cond)
@@ -25,7 +31,7 @@ def euler_sample(model, x0, cond, null_cond=None, guidance_scale=1.0, n_steps=50
     for i in range(n_steps):
         t = torch.full((x.shape[0],), i * dt, device=x.device)
         x = x + dt * cfg_forward(model, t, x, cond, null_cond, guidance_scale)
-    return x, n_steps
+    return x, n_steps * _calls_per_eval(null_cond, guidance_scale)
 
 
 def dopri5_sample(model, x0, cond, null_cond=None, guidance_scale=1.0, rtol=1e-3, atol=1e-3):
@@ -44,7 +50,8 @@ def dopri5_sample(model, x0, cond, null_cond=None, guidance_scale=1.0, rtol=1e-3
     t_span = torch.tensor([0.0, 1.0], device=x0.device)
     with torch.no_grad():
         traj = odeint(func, x0, t_span, method="dopri5", rtol=rtol, atol=atol)
-    return traj[-1], func.nfe
+    # func.nfe counts ODE-function evaluations; each is 1 or 2 model calls.
+    return traj[-1], func.nfe * _calls_per_eval(null_cond, guidance_scale)
 
 
 def sample(model, x0, cond, null_cond, cfg):

@@ -1,0 +1,61 @@
+# Flow Matching, residual (two-stage)
+# Learns r = (log1p(x1) - log1p(x_det)) / residual_std, conditioned on IR + x_det,
+# the stage-1 deterministic rain-rate prediction.
+
+# ── data ──────────────────────────────────────────────────────────────────────
+# Residual splits: base samples + a `rain_rate_det` key.
+data_csv: ./splits/train_residual_split.csv
+val_csv:  ./splits/val_residual_split.csv
+norm_csv: ./normalisation_data/normalisation.csv
+channels: WV_062,WV_073,IR_087,IR_097,IR_108,IR_120,IR_134
+
+# ── residual ──────────────────────────────────────────────────────────────────
+# The residual std lives in the `residual` row of norm_csv, not here.
+residual: true
+
+# ── transforms ────────────────────────────────────────────────────────────────
+random_flip: true
+flip_prob: 0.5
+x_transform:
+  type: Log1p
+cond_transform:
+  type: Normalize
+  sigma_factor: 1
+
+prior: gaussian
+time_sampling: power
+time_sampling_k: 3
+
+# ── model ─────────────────────────────────────────────────────────────────────
+num_channel: 64             # must be divisible by 32 (GroupNorm num_groups)
+image_size: 256
+channel_mult: [1, 1, 2, 3, 4]
+num_heads: 4 # not used
+num_head_channels: 64
+attention_resolutions: "16"
+
+use_scale_shift_norm: True
+dropout: 0.0
+
+# ── optimisation ──────────────────────────────────────────────────────────────
+total_steps: 400000
+batch_size: 16
+num_workers: 2
+lr: 1.0e-4
+weight_decay: 0.
+grad_clip: 1.0
+warmup_steps: 5000
+scheduler: cosine_warmup     # cosine_warmup | linear_warmup | constant
+ema_decay: 0.9999
+cfg_drop: 0.0
+seed: 42
+
+# ── evaluation / checkpointing ────────────────────────────────────────────────
+eval_every: 5000
+save_every: 20000
+log_every: 100
+
+# ── output ────────────────────────────────────────────────────────────────────
+output_dir: ./results/
+exp_name: FM_residual_version_6
+debug: false

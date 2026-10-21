@@ -7,12 +7,13 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+from cfm.cfm import sample_prior
 from models.build import build_unet
 from utils.config import INFERENCE_KEYS, inherited_from_checkpoint, load_inference_config
 from utils.dataset import RainIRDataset
 from utils.plotting import save_preview
 from utils.sampling import sample
-from utils.utils import build_pipeline_from_config, set_seed
+from utils.utils import RESIDUAL_DET_KEY, build_pipeline_from_config, set_seed
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -46,20 +47,25 @@ def parse_args():
 # Checkpoint helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
-def detect_n_cond(state_dict):
-    """Read n_cond from the first conv weight shape: total_in_ch - 1 (rain channel)."""
+def detect_n_cond(state_dict, residual=False):
+    """Read n_cond from the first conv weight shape: total_in_ch minus the rain
+    channel and, in residual mode, the extra x_det channel."""
     key = next((k for k in state_dict if "input_blocks.0.0.weight" in k), None)
     if key is None:
         raise ValueError(
             "checkpoint's net_model has no 'input_blocks.0.0.weight' key — "
             "unrecognized architecture or corrupt checkpoint."
         )
-    return state_dict[key].shape[1] - 1
+    return state_dict[key].shape[1] - 1 - int(residual)
 
 
-def load_model(ckpt, n_cond, num_channel, image_size, channel_mult, attention_resolutions, use_ema, device):
+def load_model(ckpt, n_cond, num_channel, image_size, channel_mult, attention_resolutions,
+               num_heads, num_head_channels, use_scale_shift_norm, dropout,
+               use_ema, device, residual=False):
     """Build the UNet and load weights from an already-read checkpoint dict."""
-    model = build_unet(num_channel, n_cond, image_size, channel_mult, attention_resolutions, device)
+    model = build_unet(num_channel, n_cond, image_size, channel_mult, attention_resolutions,
+                       num_heads, num_head_channels, device,
+                       use_scale_shift_norm, dropout, residual=residual)
 
     null_cond = ckpt["null_cond"].to(device) if "null_cond" in ckpt else None
 
@@ -98,10 +104,22 @@ def run(cfg):
     ckpt      = torch.load(checkpoint, map_location=device, weights_only=False)
     full_cfg  = ckpt.get("config", {})
     train_cfg = inherited_from_checkpoint(full_cfg, checkpoint)
-    n_cond    = detect_n_cond(ckpt["net_model"])
+    residual  = full_cfg.get("residual", False)
+    prior     = train_cfg["prior"]
+    # Required only for the student_t prior, so not an inherited key.
+    student_t_nu = full_cfg.get("student_t_nu")
+    if prior == "student_t" and student_t_nu is None:
+        raise ValueError(
+            f"{checkpoint}: prior is 'student_t' but 'student_t_nu' is absent. The "
+            f"degrees of freedom must be recorded to reproduce the source distribution."
+        )
+    n_cond    = detect_n_cond(ckpt["net_model"], residual=residual)
     model, null_cond = load_model(
         ckpt, n_cond, train_cfg["num_channel"], train_cfg["image_size"],
-        train_cfg["channel_mult"], train_cfg["attention_resolutions"], cfg["use_ema"], device,
+        train_cfg["channel_mult"], train_cfg["attention_resolutions"],
+        train_cfg["num_heads"], train_cfg["num_head_channels"],
+        train_cfg["use_scale_shift_norm"], train_cfg["dropout"],
+        cfg["use_ema"], device, residual=residual,
     )
     if cfg["guidance_scale"] != 1.0 and full_cfg.get("cfg_drop", 0.0) == 0:
         print(
@@ -123,7 +141,8 @@ def run(cfg):
     print(f"n_cond: {n_cond}  |  channels: {len(channel_list)}")
 
     # ── transform pipeline, inherited from the checkpoint ────────────────────
-    pipeline = build_pipeline_from_config({**train_cfg, "random_flip": False}, channel_list)
+    pipeline_cfg = {**train_cfg, "residual": residual}
+    pipeline = build_pipeline_from_config(pipeline_cfg, channel_list)
     print(f"Pipeline: {pipeline}  (from checkpoint config)")
 
     # ── dataset ───────────────────────────────────────────────────────────────
@@ -132,6 +151,8 @@ def run(cfg):
         csv_file       = cfg["data_csv"],
         pipeline       = pipeline,
         debug          = cfg["debug"],
+        augment        = False,
+        det_key        = RESIDUAL_DET_KEY if residual else None,
     )
 
     start_idx = cfg["start_idx"]
@@ -165,22 +186,37 @@ def run(cfg):
 
     with torch.no_grad():
         for batch in tqdm(loader, desc="Inference"):
-            x1, cond = batch
-            x1   = x1.to(device)
-            cond = cond.to(device)
-            B    = x1.shape[0]
+            batch = [t.to(device) for t in batch]
+            if residual:
+                target, cond, x_det = batch      # target is the true residual r
+            else:
+                target, cond = batch             # target is x1 in latent space
+            B = cond.shape[0]
+
+            if residual:
+                # CFG's unconditional branch nulls `cond` but keeps `x_det`; null_res is
+                # pre-expanded to the batch.
+                cond_res = torch.cat([cond, x_det], dim=1)
+                null_res = None
+                if null_cond is not None:
+                    null_full = null_cond.expand(B, -1, cond.shape[2], cond.shape[3])
+                    null_res = torch.cat([null_full, x_det], dim=1)
 
             for run_idx, run_dir in enumerate(run_dirs):
-                # Stride exceeds any realistic slice size, so run_idx never collides with
-                # global_idx. torch.manual_seed takes up to 2**64-1; do NOT swap in
-                # utils.set_seed, whose np.random.seed rejects anything >= 2**32.
+                # Distinct seed per (run, sample). Not utils.set_seed: numpy rejects seeds >= 2**32.
                 torch.manual_seed(cfg["seed"] + run_idx * 100_000_000 + global_idx)
-                x0               = torch.randn_like(x1)
-                pred_latent, nfe = sample(model, x0, cond, null_cond, cfg)
+                x0               = sample_prior(target.shape, prior, student_t_nu, device=target.device)
+                if residual:
+                    pred_latent, nfe = sample(model, x0, cond_res, null_res, cfg)
+                    pred_rain, cond_raw = pipeline.post(
+                        x=pipeline.from_residual(pred_latent, x_det), cond=cond)
+                    x1_rain, _ = pipeline.post(
+                        x=pipeline.from_residual(target, x_det), cond=cond)
+                else:
+                    pred_latent, nfe = sample(model, x0, cond, null_cond, cfg)
+                    pred_rain, cond_raw = pipeline.post(x=pred_latent, cond=cond)
+                    x1_rain, _          = pipeline.post(x=target, cond=cond)
                 total_nfe       += nfe
-
-                pred_rain, cond_raw = pipeline.post(x=pred_latent, cond=cond)
-                x1_rain, _          = pipeline.post(x=x1,          cond=cond)
 
                 if cfg["save_npy"]:
                     for i in range(B):
@@ -200,9 +236,7 @@ def run(cfg):
             global_idx += B
 
     n_samples = global_idx - start_idx
-    # nfe counts model calls, and one call evaluates a whole batch at once — so
-    # this averages over (batch, run) pairs, not (sample, run) pairs, to avoid
-    # diluting the cost by batch_size.
+    # nfe counts model calls per batch, so average over (batch, run) pairs.
     avg_nfe = total_nfe / max(len(loader) * cfg["n_runs"], 1)
     print(f"\nDone.  {n_samples} samples × {cfg['n_runs']} runs  →  {output_dir}")
     print(f"Avg NFE per solve (one batch, one run): {avg_nfe:.1f}")

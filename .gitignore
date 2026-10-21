@@ -1,9 +1,33 @@
-tests/
+# outputs
+results/
+seeds/
 *.pt
 *.npy
-*.pyc
 *.err
 *.out
-*.sh
+
+# data (real manifests hold absolute local paths)
 splits/*.csv
-!splits/*.placeholder.csv
+!splits/placeholders/
+
+# configs: track only the published ones
+configs/*
+!configs/FM_version_6.yaml
+!configs/FM_residual_version_6.yaml
+!configs/infer*.yaml
+
+# launch scripts: cluster-specific
+build/
+
+# local-only
+tests/
+docs/
+tools/
+utils/plot_metrics.py
+
+# python / editor
+__pycache__/
+*.pyc
+.pytest_cache/
+.ipynb_checkpoints/
+.DS_Store

@@ -8,10 +8,9 @@ from utils.transforms import SharedTransform, ValueTransform
 
 class Pipeline(nn.Module):
     """Routes transforms to the streams they belong to.
-    ``shared`` runs on ``(x, cond)`` together (crops, flips) and is skipped when
-    ``augment=False`` — inference wants the geometry left alone. ``x`` and
-    ``cond`` hold per-stream ``ValueTransform``s, applied in order by ``pre``
-    and undone in reverse by ``post``.
+
+        ``shared`` runs on ``(x, cond)`` together (crops, flips) and is skipped when
+        ``augment=False``. ``x`` and ``cond`` hold per-stream ``ValueTransform``s.
     """
 
     def __init__(
@@ -57,8 +56,57 @@ class Pipeline(nn.Module):
                 cond = t.inverse(cond)
         return x, cond
 
-    def __repr__(self) -> str:
-        def names(m):
-            return "[" + ", ".join(type(t).__name__ for t in m) + "]"
+    @staticmethod
+    def _names(modules) -> str:
+        return "[" + ", ".join(type(t).__name__ for t in modules) + "]"
 
-        return f"Pipeline(shared={names(self.shared)}, x={names(self.x)}, cond={names(self.cond)})"
+    def __repr__(self) -> str:
+        return (f"Pipeline(shared={self._names(self.shared)}, x={self._names(self.x)}, "
+                f"cond={self._names(self.cond)})")
+
+
+class ResidualPipeline(Pipeline):
+    """Residual variant: r = (L(x1) - L(x_det)) / residual_std, conditioned on x_det.
+
+    x1 and x_det are the same physical quantity, so they share `self.x` — the
+    difference is only defined in a single space.
+
+    ``pre`` -> ``(r, cond_t, x_det_t)``; ``from_residual`` then ``post(x=...)``
+    rebuild physical units.
+    """
+
+    def __init__(self, shared=(), x=(), cond=(), residual_std=1.0):
+        super().__init__(shared=shared, x=x, cond=cond)
+        if residual_std <= 0:
+            raise ValueError(f"residual_std must be > 0, got {residual_std!r}.")
+        self.residual_std = float(residual_std)
+
+    def pre(self, x, cond, x_det, augment=True):
+        """Raw -> (residual target, transformed cond, transformed x_det baseline).
+
+        The shared geometric transforms must see ``x`` and ``x_det`` in a single draw,
+        or a second flip/crop would desync them.
+        """
+        if augment:
+            # stack, not cat: a new leading axis works for [C, H, W] and [B, C, H, W]
+            # alike, whereas cat would extend the batch axis and pair up samples 0 and 1.
+            pair = torch.stack([x, x_det])
+            for t in self.shared:
+                pair, cond = t(pair, cond)
+            x, x_det = pair[0], pair[1]
+        for t in self.x:
+            x, x_det = t(x), t(x_det)
+        for t in self.cond:
+            cond = t(cond)
+        return (x - x_det) / self.residual_std, cond, x_det
+
+    def from_residual(self, r, x_det_t):
+        """Residual target + transformed baseline -> ``x``-space field.
+
+        Feed the result to ``post(x=...)`` to get physical units.
+        """
+        return x_det_t + r * self.residual_std
+
+    def __repr__(self):
+        return (f"ResidualPipeline(shared={self._names(self.shared)}, x={self._names(self.x)}, "
+                f"cond={self._names(self.cond)}, residual_std={self.residual_std:.4f})")

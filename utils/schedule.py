@@ -1,12 +1,13 @@
 import math
 
 
-def cosine_warmup(step: int, warmup: int, total: int) -> float:
-    """Linear warmup to 1.0 over `warmup` steps, then cosine decay to 0 at `total`."""
+def cosine_warmup(step: int, warmup: int, total: int, min_lr_ratio: float = 0.1) -> float:
+    """Linear warmup to 1.0 over `warmup` steps, then cosine decay to `min_lr_ratio` at `total` (held flat past `total`)."""
     if step < warmup:
         return step / max(warmup, 1)
-    progress = (step - warmup) / max(total - warmup, 1)
-    return 0.5 * (1.0 + math.cos(math.pi * progress))
+    progress = min((step - warmup) / max(total - warmup, 1), 1.0)
+    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+    return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
 
 
 def linear_warmup(step: int, warmup: int, total: int) -> float:

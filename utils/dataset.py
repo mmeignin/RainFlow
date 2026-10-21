@@ -29,14 +29,13 @@ def _as_hw_float32(array, path: str, key: str) -> np.ndarray:
 class RainIRDataset(Dataset):
     """Rain rate (target) conditioned on infrared channels, for flow matching.
 
-    Each sample is a ``.npy`` file holding a pickled dict: one ``rain_key``
-    entry plus one 2-D ``[H, W]`` array per conditioning channel. ``file_list``
-    holds absolute paths.
+    Each sample is a ``.npy`` holding a pickled dict: ``rain_key`` plus one 2-D
+    ``[H, W]`` array per conditioning channel. ``file_list`` holds absolute paths.
 
-    ``__getitem__`` returns float32 ``(x, cond)`` of shape ``[1, H, W]`` and
-    ``[C, H, W]``, channels stacked in ``cond_keys`` order; with
-    ``return_timestamps``, the manifest timestamp is appended as a third
-    element. ``pipeline``, if given, is applied as ``pipeline.pre(x, cond)``.
+    ``__getitem__`` yields ``(x, cond)``, or ``(x, cond, x_det)`` when ``det_key``
+    is set for two-stage residual training — plus the manifest timestamp if
+    ``return_timestamps``. ``augment=False`` skips the shared flip/crop transforms,
+    which is what val and inference want.
     """
 
     def __init__(
@@ -47,6 +46,8 @@ class RainIRDataset(Dataset):
         pipeline: Optional[object] = None,
         timestamps: Optional[Sequence[str]] = None,
         return_timestamps: bool = False,
+        augment: bool = True,
+        det_key: Optional[str] = None,
     ):
         self.cond_keys = list(cond_keys)
         self.file_list = list(file_list)
@@ -54,6 +55,8 @@ class RainIRDataset(Dataset):
         self.pipeline = pipeline
         self.timestamps = list(timestamps) if timestamps is not None else None
         self.return_timestamps = return_timestamps
+        self.augment = augment
+        self.det_key = det_key
         self._validate()
 
     def _validate(self) -> None:
@@ -66,11 +69,16 @@ class RainIRDataset(Dataset):
             raise ValueError(f"cond_keys contains duplicates: {dupes}")
         if self.rain_key in keys:
             raise ValueError(f"cond_keys must not contain the target key {self.rain_key!r}.")
+        if self.det_key is not None:
+            if self.det_key in keys:
+                raise ValueError(f"cond_keys must not contain det_key {self.det_key!r}.")
+            if self.det_key == self.rain_key:
+                raise ValueError(f"det_key must differ from rain_key {self.rain_key!r}.")
         if not files:
             raise ValueError("file_list is empty; nothing to load.")
         if self.pipeline is not None and not callable(getattr(self.pipeline, "pre", None)):
             raise TypeError(
-                f"pipeline must expose a callable .pre(x, cond); "
+                f"pipeline must expose a callable .pre(...); "
                 f"got {type(self.pipeline).__name__}."
             )
         if self.return_timestamps and ts is None:
@@ -97,7 +105,8 @@ class RainIRDataset(Dataset):
         path = self.file_list[idx]
         data = _load_payload(path)
 
-        missing = [k for k in (self.rain_key, *self.cond_keys) if k not in data]
+        required = (self.rain_key, *self.cond_keys, *([self.det_key] if self.det_key else ()))
+        missing = [k for k in required if k not in data]
         if missing:
             raise KeyError(f"{path}: missing keys {missing}; available keys: {sorted(data)}")
 
@@ -112,16 +121,30 @@ class RainIRDataset(Dataset):
 
         x = torch.from_numpy(rain).unsqueeze(0)
         cond = torch.from_numpy(np.stack(channels))
-        if self.pipeline is not None:
-            x, cond = self.pipeline.pre(x, cond)
 
-        return (x, cond, self.timestamps[idx]) if self.return_timestamps else (x, cond)
+        if self.det_key is not None:
+            det = _as_hw_float32(data[self.det_key], path, self.det_key)
+            if det.shape != rain.shape:
+                raise ValueError(
+                    f"{path}: {self.det_key!r} shape {det.shape} must match "
+                    f"{self.rain_key} shape {rain.shape}"
+                )
+            x_det = torch.from_numpy(det).unsqueeze(0)
+            if self.pipeline is not None:
+                x, cond, x_det = self.pipeline.pre(x, cond, x_det, augment=self.augment)
+            out = (x, cond, x_det)
+        else:
+            if self.pipeline is not None:
+                x, cond = self.pipeline.pre(x, cond, augment=self.augment)
+            out = (x, cond)
+
+        return (*out, self.timestamps[idx]) if self.return_timestamps else out
 
     def __repr__(self) -> str:
         pipeline = type(self.pipeline).__name__ if self.pipeline is not None else None
         return (
             f"{type(self).__name__}(n={len(self)}, cond_keys={self.cond_keys}, "
-            f"rain_key={self.rain_key!r}, pipeline={pipeline})"
+            f"rain_key={self.rain_key!r}, det_key={self.det_key!r}, pipeline={pipeline})"
         )
 
     @classmethod
@@ -134,10 +157,13 @@ class RainIRDataset(Dataset):
         debug: bool = False,
         debug_samples: int = 64,
         return_timestamps: bool = False,
+        augment: bool = True,
+        det_key: Optional[str] = None,
     ) -> "RainIRDataset":
         """Build from a manifest with an absolute-path ``path`` column and an
         optional ``timestamp`` column. ``debug`` keeps only the first
-        ``debug_samples`` rows."""
+        ``debug_samples`` rows. ``augment`` and ``det_key`` are passed through to
+        the dataset."""
         if not os.path.exists(csv_file):
             raise FileNotFoundError(f"CSV file not found: {csv_file}")
 
@@ -164,6 +190,8 @@ class RainIRDataset(Dataset):
             pipeline=pipeline,
             timestamps=meta["timestamp"].astype(str).tolist() if has_ts else None,
             return_timestamps=return_timestamps,
+            augment=augment,
+            det_key=det_key,
         )
 
 

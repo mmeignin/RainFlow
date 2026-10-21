@@ -5,8 +5,8 @@ import numpy as np
 import pandas as pd
 import torch
 
-from utils.pipeline import Pipeline
-from utils.transforms import Log1pZScore, MinMax, Normalize, RandomFlip
+from utils.pipeline import Pipeline, ResidualPipeline
+from utils.transforms import Log1p, Log1pZScore, MinMax, Normalize, RandomFlip
 
 
 def set_seed(seed: int) -> None:
@@ -18,11 +18,13 @@ def set_seed(seed: int) -> None:
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
+
 def infiniteloop(dataloader):
     """Cycle a DataLoader indefinitely, yielding batches forever."""
     while True:
         for batch in dataloader:
             yield batch
+
 
 @torch.no_grad()
 def ema(source, target, decay):
@@ -36,6 +38,8 @@ def ema(source, target, decay):
 # ──────────────────────────────────────────────────────────────────────────────
 
 RAIN_CHANNEL = "rain_rate"
+RESIDUAL_CHANNEL = "residual"       # row in the norm CSV holding the residual std
+RESIDUAL_DET_KEY = "rain_rate_det"  # dict key holding the frozen stage-1 prediction
 
 
 def read_norm_stats(csv_path: str, channels: list, columns: list) -> dict:
@@ -77,11 +81,16 @@ def _log1p(stats, config):
     return Log1pZScore(stats["log1p_mean"][0], stats["log1p_std"][0])
 
 
+def _log1p_bare(stats, config):
+    return Log1p()
+
+
 # transform type -> (stats columns it needs, factory, streams it may be used on, extra config keys allowed)
 TRANSFORMS = {
-    "Normalize":   (["mean", "std"],              _normalize, {"x", "cond"}, {"sigma_factor"}),
-    "MinMax":      (["vmin", "vmax"],             _minmax,    {"cond"},      set()),
-    "Log1pZScore": (["log1p_mean", "log1p_std"],  _log1p,     {"x"},         set()),
+    "Normalize":   (["mean", "std"],              _normalize,  {"x", "cond"}, {"sigma_factor"}),
+    "MinMax":      (["vmin", "vmax"],             _minmax,     {"cond"},      set()),
+    "Log1pZScore": (["log1p_mean", "log1p_std"],  _log1p,      {"x"},         set()),
+    "Log1p":       ([],                           _log1p_bare, {"x"},         set()),
 }
 
 
@@ -110,18 +119,12 @@ def _value_transform(stream: str, config: dict, csv_path: str, channels: list) -
 
 
 def build_pipeline_from_config(config: dict, channel_list: list) -> Pipeline:
-    """Build a `Pipeline` from a config dict.
+    """Build a `Pipeline` from a config dict. All keys optional; an absent transform
+    block leaves that stream in raw units.
 
-    All keys optional; an absent transform block leaves that stream in raw units.
-
-        norm_csv:       path to the single normalisation CSV
-        random_flip:    bool, with flip_prob (default 0.5)
-        x_transform:    {type: Normalize | Log1pZScore}
-        cond_transform: {type: Normalize | MinMaxs}
-
-    `x` reads the `rain_rate` row; `cond` reads one row per `channel_list` entry,
-    in order. Naming a transform without `norm_csv`, or naming an unknown type,
-    raises — silently skipping either would train on unnormalised data.
+    `x` reads the `rain_rate` row of `norm_csv`; `cond` reads one row per `channel_list`
+    entry, in order. Naming a transform without `norm_csv`, or an unknown type, raises —
+    silently skipping either would train on unnormalised data.
     """
     csv_path = config.get("norm_csv")
 
@@ -129,10 +132,25 @@ def build_pipeline_from_config(config: dict, channel_list: list) -> Pipeline:
     if config.get("random_flip", False):
         shared.append(RandomFlip(p=config.get("flip_prob", 0.5)))
 
-    ### If you want to add Crops you should do it here 
+    # RandomCrop / CenterCrop (transforms.py) are not wired to the config;
+    # append them to `shared` here to use them.
 
-    return Pipeline(
-        shared=shared,
-        x=_value_transform("x", config.get("x_transform") or {}, csv_path, [RAIN_CHANNEL]),
-        cond=_value_transform("cond", config.get("cond_transform") or {}, csv_path, channel_list),
-    )
+    x = _value_transform("x", config.get("x_transform") or {}, csv_path, [RAIN_CHANNEL])
+    cond = _value_transform("cond", config.get("cond_transform") or {}, csv_path, channel_list)
+
+    if config.get("residual", False):
+        # residual_std is fitted on the log1p difference (the `residual` row of the norm
+        # CSV), so x_transform must be the transform it was fitted under.
+        x_type = (config.get("x_transform") or {}).get("type")
+        if x_type != "Log1p":
+            raise ValueError(
+                f"residual mode requires x_transform.type=Log1p (got {x_type!r}). Any "
+                "other transform rescales the target and double-counts the CSV-fitted "
+                "residual std — silently, since post() still round-trips."
+            )
+        if not csv_path:
+            raise ValueError("residual training requires a top-level 'norm_csv' path.")
+        rstats = read_norm_stats(csv_path, [RESIDUAL_CHANNEL], ["std"])
+        return ResidualPipeline(shared=shared, x=x, cond=cond, residual_std=rstats["std"][0])
+
+    return Pipeline(shared=shared, x=x, cond=cond)

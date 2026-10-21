@@ -1,8 +1,7 @@
-"""Implements Conditional Flow Matcher Losses."""
-
 # Author: Alex Tong
 #         Kilian Fatras
 #         +++
+# Copyright (c) 2023 Alexander Tong
 # License: MIT License
 # from https://github.com/atong01/conditional-flow-matching/blob/main/torchcfm/conditional_flow_matching.py
 
@@ -215,6 +214,83 @@ class ConditionalFlowMatcher:
         """
         sigma_t = self.compute_sigma_t(t)
         return 2 * sigma_t / (self.sigma**2 + 1e-8)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Source prior and training-timestep samplers (config-agnostic; callers pass args)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def sample_prior(shape, prior="gaussian", nu=None, device=None):
+    """Draw the flow-matching source x0.
+
+    `gaussian`   : x0 ~ N(0, I). `nu` is unused.
+    `student_t`  : unit-variance multivariate Student-t (Pandey et al., ICLR 2025,
+                   t-Flow). One chi-square scalar per sample scales the whole field:
+                       x0 = z * sqrt((nu - 2) / v),  z ~ N(0, I),  v ~ chi2(nu).
+                   Heavier tails than the Gaussian, SAME variance (the (nu-2)
+                   factor normalises Var to 1), so the path/objective are otherwise
+                   identical. `v` is one scalar per sample -> a true multivariate-t.
+                   `nu` defaults to 5.0 (the paper's choice) when unspecified.
+    """
+    z = torch.randn(shape, device=device)
+    if prior == "gaussian":
+        return z
+    if prior == "student_t":
+        nu = 5.0 if nu is None else nu
+        if nu <= 2:
+            raise ValueError(f"student_t nu must be > 2 for finite variance, got {nu}.")
+        v = torch.distributions.Chi2(float(nu)).sample((shape[0],)).to(z.device)
+        scale = torch.sqrt((nu - 2) / v).view(-1, *([1] * (z.dim() - 1)))
+        return z * scale
+    raise ValueError(f"unknown prior {prior!r}; expected 'gaussian' or 'student_t'.")
+
+
+def sample_timesteps(n, kind="uniform", std=None, k=None, mix_prob=None, device=None):
+    """Draw training timesteps in [0, 1]. Convention: t=0 is noise, t=1 is data.
+
+    `uniform`      : t ~ U[0, 1]. `std`/`k`/`mix_prob` unused.
+    `logit_normal` : t = sigmoid(std * z), z ~ N(0, 1). Concentrates samples on
+                     mid-path timesteps (the SD3 / EDM weighting). Density is zero
+                     at both t = 0 and t = 1. `std` defaults to 1.0.
+    `power`        : t = u^k, u ~ U[0, 1], with density p(t) = (1/k) t^(1/k - 1).
+                     k = 1 is uniform; k > 1 shifts mass toward t = 0, where xt
+                     carries no signal and the velocity can only be predicted from
+                     the conditioning. The density diverges at t = 0, which
+                     logit_normal cannot express. `k` defaults to 1.5.
+    `logit_normal_power_mix` : per-sample mixture of the two above: with
+                     probability `mix_prob` (default 0.2) draw from `power(k)`,
+                     otherwise from `logit_normal(std)`. Adds mass near t = 0 to
+                     logit_normal while keeping its mid-path concentration (cf. Lin
+                     et al. 2024, "Common Diffusion Noise Schedules and Sample
+                     Steps are Flawed"). `k` defaults to 3.0 here.
+
+    Inference is unaffected (it integrates the whole ODE); this only reweights
+    which t the training loss sees.
+    """
+    if kind == "uniform":
+        return torch.rand(n, device=device)
+    if kind == "logit_normal":
+        std = 1.0 if std is None else std
+        return torch.sigmoid(std * torch.randn(n, device=device))
+    if kind == "power":
+        k = 1.5 if k is None else k
+        if k <= 0:
+            raise ValueError(f"time_sampling_k must be > 0, got {k}.")
+        return torch.rand(n, device=device) ** k
+    if kind == "logit_normal_power_mix":
+        mix_prob = 0.2 if mix_prob is None else mix_prob
+        if not 0.0 <= mix_prob <= 1.0:
+            raise ValueError(f"time_sampling_mix_prob must be in [0, 1], got {mix_prob}.")
+        mix_k = 3.0 if k is None else k
+        from_power = torch.rand(n, device=device) < mix_prob
+        t_power = sample_timesteps(n, kind="power", k=mix_k, device=device)
+        t_logit_normal = sample_timesteps(n, kind="logit_normal", std=std, device=device)
+        return torch.where(from_power, t_power, t_logit_normal)
+    raise ValueError(
+        f"unknown time_sampling {kind!r}; expected 'uniform', 'logit_normal', 'power' "
+        f"or 'logit_normal_power_mix'."
+    )
+
 
 if __name__ == "__main__":
     cfm = ConditionalFlowMatcher(sigma=0.0)  # sigma must be float or int
